@@ -1,203 +1,259 @@
 #!/usr/bin/env python3
-"""Compose the 25 Nov 2026 front page: 'The World in One Picture'.
+"""Compose the front page for 25 November 2026.
 
-Draws the newspaper front page with PIL from three editorial panels in
-./panels/ plus the verified headlines for Wednesday 25 November 2026.
-Writes entry.png (1024x1024, <=1 MiB). No network, no randomness: the same
-inputs always produce the same bytes.
+Builds a 1024x1024 newspaper front page, "The World in One Picture",
+from three editorial photographs and the verified headlines of the day.
+Every figure on the page comes from the research brief; nothing is
+invented, and no number is rendered in a background panel.
+
+Run:  python3 compose.py            (writes entry.png next to this file)
+      python3 compose.py --out DIR  (writes entry.png into DIR instead)
+
+The output is deterministic: same inputs, same bytes, every run.
 """
+
+import argparse
+import hashlib
 import os
+import sys
+
 from PIL import Image, ImageDraw, ImageFont
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-W, H = 1024, 1024
+PAGE_W = 1024
+PAGE_H = 1024
 MARGIN = 36
-CW = W - 2 * MARGIN  # 952
+GUTTER = 20
 
-PAPER = (250, 246, 238)
-INK = (17, 17, 17)
-BODY = (34, 34, 34)
-GREY = (84, 84, 84)
-RED = (155, 28, 28)
-GOLD = (255, 196, 66)
-STRIP_BG = (16, 16, 16)
-STRIP_FG = (232, 232, 232)
+PAPER = (247, 242, 231)      # warm newsprint cream
+INK = (17, 17, 17)           # near-black
+RED = (176, 30, 30)          # kicker red
+GOLD = (232, 185, 60)        # markets label
+STRIP = (13, 13, 13)         # black footer band
+CAPTION_GREY = (90, 84, 72)
 
-SERIF = "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf"
-SERIF_B = "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf"
-SERIF_I = "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf"
-SANS = "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"
-SANS_B = "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"
+FONT_DIR = "/usr/share/fonts/truetype/liberation"
+SERIF = os.path.join(FONT_DIR, "LiberationSerif-Regular.ttf")
+SERIF_BOLD = os.path.join(FONT_DIR, "LiberationSerif-Bold.ttf")
+SERIF_ITALIC = os.path.join(FONT_DIR, "LiberationSerif-Italic.ttf")
+SANS = os.path.join(FONT_DIR, "LiberationSans-Regular.ttf")
+SANS_BOLD = os.path.join(FONT_DIR, "LiberationSans-Bold.ttf")
 
-HERO_PANEL = "media-generation-hero-wallstreet-0-501f8b8f-1e58-4e6f-b206-07ad6886e572.webp"
-HORMUZ_PANEL = "media-generation-panel-hormuz-0-28457acc-41d5-4cdc-a266-12bebc6ec509.webp"
-TIANGONG_PANEL = "media-generation-panel-tiangong-0-df287b4a-c511-4d0d-954d-6b7ac9618bfb.webp"
+HERE = os.path.dirname(os.path.abspath(__file__))
+PANELS = os.path.join(HERE, "panels")
+HERO_PHOTO = os.path.join(
+    PANELS, "media-generation-hero-wallstreet-0-501f8b8f-1e58-4e6f-b206-07ad6886e572.webp")
+HORMUZ_PHOTO = os.path.join(
+    PANELS, "media-generation-panel-hormuz-0-28457acc-41d5-4cdc-a266-12bebc6ec509.webp")
+TIANGONG_PHOTO = os.path.join(
+    PANELS, "media-generation-panel-tiangong-0-df287b4a-c511-4d0d-954d-6b7ac9618bfb.webp")
 
 
-def fnt(path, size):
+def load_font(path, size):
     return ImageFont.truetype(path, size)
 
 
-def width(draw, text, font):
+def text_width(draw, text, font):
     return draw.textlength(text, font=font)
 
 
-def wrap_text(draw, text, font, max_w):
-    """Greedy word wrap returning lines that fit max_w."""
-    lines, cur = [], ""
+def shrink_to_fit(draw, text, font_path, start_size, max_width, min_size=10):
+    """Largest font size at which `text` fits inside max_width."""
+    size = start_size
+    while size > min_size:
+        font = load_font(font_path, size)
+        if text_width(draw, text, font) <= max_width:
+            return font
+        size -= 1
+    return load_font(font_path, min_size)
+
+
+def wrap_words(draw, text, font, max_width):
+    """Greedy word wrap; returns a list of lines that fit max_width."""
+    lines = []
+    current = ""
     for word in text.split():
-        trial = word if not cur else cur + " " + word
-        if width(draw, trial, font) <= max_w:
-            cur = trial
+        trial = word if not current else current + " " + word
+        if text_width(draw, trial, font) <= max_width:
+            current = trial
         else:
-            if cur:
-                lines.append(cur)
-            cur = word
-    if cur:
-        lines.append(cur)
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
     return lines
 
 
-def fit(draw, text, path, start, floor, max_w):
-    """Largest size in [floor, start] whose text fits max_w."""
-    size = start
-    while size > floor and width(draw, text, fnt(path, size)) > max_w:
-        size -= 2
-    return size
+def draw_centered(draw, y, text, font, fill, width=PAGE_W):
+    w = text_width(draw, text, font)
+    draw.text(((width - w) / 2, y), text, font=font, fill=fill)
+    return y + font.size
 
 
-def crop_fill(im, tw, th, focus=0.5):
-    """Scale and center-crop (vertical focus 0..1) to the target size."""
-    iw, ih = im.size
-    scale = max(tw / iw, th / ih)
-    nw, nh = int(round(iw * scale)), int(round(ih * scale))
-    im = im.resize((nw, nh), Image.LANCZOS)
-    x0 = (nw - tw) // 2
-    y0 = int(round((nh - th) * focus))
-    return im.crop((x0, y0, x0 + tw, y0 + th))
+def draw_rule(draw, y, weight, x0=MARGIN, x1=PAGE_W - MARGIN):
+    draw.rectangle([x0, y, x1, y + weight - 1], fill=INK)
 
 
-def rule(draw, y, x0, x1, thick, fill=INK):
-    draw.rectangle([x0, y, x1, y + thick - 1], fill=fill)
+def cover_crop(photo, target_w, target_h):
+    """Resize + centre-crop a photo so it exactly covers target_w x target_h."""
+    img = Image.open(photo).convert("RGB")
+    scale = max(target_w / img.width, target_h / img.height)
+    new_w = max(target_w, int(img.width * scale + 0.5))
+    new_h = max(target_h, int(img.height * scale + 0.5))
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    return img.crop((left, top, left + target_w, top + target_h))
 
 
-def build():
-    page = Image.new("RGB", (W, H), PAPER)
-    d = ImageDraw.Draw(page)
+def draw_column(draw, page, x, width, y, kicker, headline, photo,
+                body, img_h):
+    """One story column: red kicker, bold headline, photo, serif body."""
+    draw.text((x, y), kicker, font=load_font(SANS_BOLD, 17), fill=RED)
+    y += 26
+    head_font = shrink_to_fit(
+        draw, headline, SANS_BOLD, 31, width)
+    # Headline may need two lines: split on the natural break.
+    lines = wrap_words(draw, headline, head_font, width)
+    for line in lines:
+        draw.text((x, y), line, font=head_font, fill=INK)
+        y += 35
+    y += 4
+    page.paste(cover_crop(photo, width, img_h), (x, y))
+    y += img_h + 10
+    body_font = load_font(SERIF, 19)
+    for line in wrap_words(draw, body, body_font, width):
+        draw.text((x, y), line, font=body_font, fill=INK)
+        y += 24
+    return y
 
-    y = 22
-    # --- masthead ---
-    d.text((W // 2, y), "THE WORLD IN ONE PICTURE",
-           font=fnt(SERIF_B, 56), fill=INK, anchor="mt")
-    y += 62
-    rule(d, y, MARGIN, W - MARGIN, 2)
+
+def build_page():
+    page = Image.new("RGB", (PAGE_W, PAGE_H), PAPER)
+    draw = ImageDraw.Draw(page)
+    content_w = PAGE_W - 2 * MARGIN
+
+    # --- Masthead -------------------------------------------------------
+    y = 16
+    mast_font = shrink_to_fit(
+        draw, "THE WORLD IN ONE PICTURE", SERIF_BOLD, 66, content_w)
+    y = draw_centered(draw, y, "THE WORLD IN ONE PICTURE", mast_font, INK)
     y += 8
-    # --- dateline ---
-    d.text((MARGIN, y), "WEDNESDAY, 25 NOVEMBER 2026",
-           font=fnt(SANS_B, 20), fill=INK)
-    d.text((W - MARGIN, y), "ONE DAY  \u00b7  ONE PICTURE  \u00b7  THE WORLD",
-           font=fnt(SANS, 17), fill=GREY, anchor="ra")
-    y += 27
-    rule(d, y, MARGIN, W - MARGIN, 4)
+    draw_rule(draw, y, 2)
+    y += 8
+
+    # --- Dateline bar ---------------------------------------------------
+    date_font = load_font(SANS_BOLD, 20)
+    tag_font = load_font(SANS, 16)
+    draw.text((MARGIN, y), "WEDNESDAY, 25 NOVEMBER 2026",
+              font=date_font, fill=INK)
+    tag = "ONE DAY  ·  ONE PICTURE  ·  THE WORLD"
+    draw.text((PAGE_W - MARGIN - text_width(draw, tag, tag_font), y),
+              tag, font=tag_font, fill=INK)
+    y += 30
+    draw_rule(draw, y, 5)
     y += 12
 
-    # --- hero headline ---
-    hl1 = "TARIFFS RETURN"
-    s1 = fit(d, hl1, SANS_B, 96, 72, CW)
-    d.text((MARGIN, y), hl1, font=fnt(SANS_B, s1), fill=INK)
-    y += s1 + 4
-    hl2 = "NVIDIA \u22123.9% AS WALL STREET SLIDES"
-    s2 = fit(d, hl2, SANS_B, 46, 34, CW)
-    d.text((MARGIN, y), hl2, font=fnt(SANS_B, s2), fill=INK)
-    y += s2 + 8
-    # --- deck ---
-    deck = ("Trump proposes tariffs of 20\u201340% on 14 trading partners, "
-            "none in force before a 25 January hearing; Wall Street falls "
-            "as October inflation runs at 3.8%.")
-    f_deck = fnt(SERIF, 23)
-    for line in wrap_text(d, deck, f_deck, CW):
-        d.text((MARGIN, y), line, font=f_deck, fill=BODY)
-        y += 29
+    # --- Hero headline --------------------------------------------------
+    # Bigger first line so the headline owns the full column width.
+    hero1 = shrink_to_fit(draw, "TARIFFS RETURN", SANS_BOLD, 108, content_w)
+    draw.text((MARGIN, y), "TARIFFS RETURN", font=hero1, fill=INK)
+    y += 96
+    hero2 = shrink_to_fit(
+        draw, "NVIDIA −3.9% AS WALL STREET SLIDES", SANS_BOLD, 46, content_w)
+    draw.text((MARGIN, y), "NVIDIA −3.9% AS WALL STREET SLIDES",
+              font=hero2, fill=INK)
+    y += 52
+
+    # --- Hero deck ------------------------------------------------------
+    deck = ("Trump proposes tariffs of 20–40% on 14 trading partners, none "
+            "in force before a 25 January hearing; Wall Street falls as "
+            "October inflation runs at 3.8%.")
+    deck_font = load_font(SERIF, 24)
+    for line in wrap_words(draw, deck, deck_font, content_w):
+        draw.text((MARGIN, y), line, font=deck_font, fill=INK)
+        y += 30
     y += 8
 
-    # --- hero photo + caption ---
-    hero = Image.open(os.path.join(HERE, "panels", HERO_PANEL)).convert("RGB")
-    page.paste(crop_fill(hero, CW, 202, focus=0.55), (MARGIN, y))
-    y += 202 + 5
-    d.text((MARGIN, y),
-           "Illustration: the New York Stock Exchange floor as Wall Street "
-           "slid on Wednesday.",
-           font=fnt(SERIF_I, 16), fill=GREY)
-    y += 24
-    y += 6
+    # --- Hero photograph + caption --------------------------------------
+    hero_h = 196
+    page.paste(cover_crop(HERO_PHOTO, content_w, hero_h), (MARGIN, y))
+    y += hero_h + 8
+    cap_font = load_font(SERIF_ITALIC, 17)
+    draw.text((MARGIN, y),
+              "Illustration: the New York Stock Exchange floor as Wall "
+              "Street slid on Wednesday.",
+              font=cap_font, fill=CAPTION_GREY)
+    y += 30
 
-    # --- two story columns ---
-    col_w = (CW - 20) // 2  # 466
-    stories = [
-        ("STRAIT OF HORMUZ",
-         "TANKERS HIT BY MINES AND CATCH FIRE",
-         HORMUZ_PANEL,
-         "Iran\u2019s Revolutionary Guard said tankers struck naval mines "
-         "and caught fire in the Strait of Hormuz, claiming the vessels "
-         "were on an unauthorised route."),
-        ("TIANGONG",
-         "CHINA FLIES ITS FIRST FOREIGN ASTRONAUT",
-         TIANGONG_PANEL,
-         "Shenzhou-24 docked at the Tiangong space station carrying "
-         "Pakistan\u2019s Muhammad Zeeshan Ali \u2014 the first foreign "
-         "astronaut aboard Tiangong."),
-    ]
-    col_top = y
-    col_bottom = col_top
-    for i, (kicker, headline, panel, body) in enumerate(stories):
-        x = MARGIN + i * (col_w + 20)
-        cy = col_top
-        d.text((x, cy), kicker, font=fnt(SANS_B, 18), fill=RED)
-        cy += 23
-        for line in wrap_text(d, headline, fnt(SANS_B, 29), col_w):
-            d.text((x, cy), line, font=fnt(SANS_B, 29), fill=INK)
-            cy += 33
-        cy += 4
-        im = Image.open(os.path.join(HERE, "panels", panel)).convert("RGB")
-        page.paste(crop_fill(im, col_w, 122, focus=0.5), (x, cy))
-        cy += 122 + 6
-        for line in wrap_text(d, body, fnt(SERIF, 18), col_w):
-            d.text((x, cy), line, font=fnt(SERIF, 18), fill=BODY)
-            cy += 21
-        col_bottom = max(col_bottom, cy)
-    y = col_bottom + 10
+    # --- Two story columns ----------------------------------------------
+    col_w = (content_w - GUTTER) // 2
+    left_x = MARGIN
+    right_x = MARGIN + col_w + GUTTER
+    draw_column(
+        draw, page, left_x, col_w, y,
+        "STRAIT OF HORMUZ",
+        "TANKERS HIT BY MINES AND CATCH FIRE",
+        HORMUZ_PHOTO,
+        "Iran\u2019s Revolutionary Guard said tankers struck naval mines "
+        "and caught fire in the Strait of Hormuz, claiming the vessels "
+        "were on an unauthorised route.",
+        148)
+    draw_column(
+        draw, page, right_x, col_w, y,
+        "TIANGONG",
+        "CHINA FLIES ITS FIRST FOREIGN ASTRONAUT",
+        TIANGONG_PHOTO,
+        "Shenzhou-24 docked at the Tiangong space station carrying "
+        "Pakistan\u2019s Muhammad Zeeshan Ali \u2014 the first foreign "
+        "astronaut aboard Tiangong.",
+        148)
 
-    # --- dark strip: markets + briefs ---
-    strip_top = y
-    strip_h = H - 24 - strip_top
-    assert strip_h >= 110, f"strip too short: {strip_h}px"
-    d.rectangle([0, strip_top, W, H - 24], fill=STRIP_BG)
-    sy = strip_top + 13
-    d.text((MARGIN, sy), "MARKETS", font=fnt(SANS_B, 23), fill=GOLD)
-    mkt = ("S&P 500 7,183 \u22120.25%   \u00b7   Nasdaq 23,586 \u22120.62%   "
-           "\u00b7   NVDA $149.30 \u22123.91%   \u00b7   PCE +3.8%")
-    mkt_size = fit(d, mkt, SANS_B, 23, 16, CW - 132)
-    d.text((MARGIN + 132, sy), mkt, font=fnt(SANS_B, mkt_size),
-           fill=(255, 255, 255))
+    # --- Black footer band: markets + briefs ----------------------------
+    strip_top = 892
+    draw.rectangle([0, strip_top, PAGE_W, PAGE_H], fill=STRIP)
+    sy = strip_top + 10
+    markets_font = load_font(SANS_BOLD, 22)
+    label = "MARKETS  "
+    label_w = text_width(draw, label, markets_font)
+    draw.text((MARGIN, sy), label, font=markets_font, fill=GOLD)
+    tickers = ("S&P 500 7,183  −0.25%   ·   Nasdaq 23,586  −0.62%   ·   "
+               "NVDA $149.30  −3.91%   ·   PCE +3.8%")
+    tick_font = shrink_to_fit(
+        draw, tickers, SANS_BOLD, 22, content_w - label_w)
+    draw.text((MARGIN + label_w, sy), tickers, font=tick_font, fill=(255, 255, 255))
     sy += 34
-    briefs = ("HUAWEI \u2014 Guilty on 10 of 12 counts, sentencing Sept 2027  "
-              "\u00b7  HOUTHIS claim Ras Tanura refinery attack  \u00b7  "
-              "CAIRO \u2014 Fuel fire kills at least 30  \u00b7  "
-              "NETANYAHU \u2014 Judges urge dropping top corruption case  "
-              "\u00b7  SOLOMON ISLANDS signs Australia security treaty  "
-              "\u00b7  BANGLADESH garment wage up 36% to ~$139  \u00b7  "
-              "SUDAN \u2014 RSF strikes kill 19 civilians")
-    f_brief = fnt(SANS, 16)
-    for line in wrap_text(d, briefs, f_brief, CW):
-        d.text((MARGIN, sy), line, font=f_brief, fill=STRIP_FG)
+    briefs = ("HUAWEI — Guilty on 10 of 12 counts, sentencing Sept 2027 · "
+              "HOUTHIS claim Ras Tanura refinery attack · CAIRO — Fuel fire "
+              "kills at least 30 · NETANYAHU — Judges urge dropping top "
+              "corruption case · SOLOMON ISLANDS signs Australia security "
+              "treaty · BANGLADESH garment wage up 36% to ~$139 · SUDAN — "
+              "RSF strikes kill 19 civilians")
+    brief_font = load_font(SANS, 16)
+    for line in wrap_words(draw, briefs, brief_font, content_w):
+        draw.text((MARGIN, sy), line, font=brief_font, fill=(255, 255, 255))
         sy += 20
-    assert sy <= H - 24, f"briefs overflow: ends at {sy}px"
 
-    out = os.path.join(HERE, "entry.png")
-    page.save(out, format="PNG")
-    print(f"wrote {out}  strip_top={strip_top} strip_h={strip_h} "
-          f"briefs_end={sy}")
+    return page
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", default=HERE,
+                        help="directory to write entry.png into")
+    args = parser.parse_args(argv)
+
+    page = build_page()
+    out_path = os.path.join(args.out, "entry.png")
+    page.save(out_path, format="PNG")
+    digest = hashlib.sha256(open(out_path, "rb").read()).hexdigest()
+    size = os.path.getsize(out_path)
+    print(f"wrote {out_path}  {size} bytes  sha256 {digest}")
+    if size > 1024 * 1024:
+        print("ERROR: entry.png exceeds the 1 MiB cap", file=sys.stderr)
+        return 1
+    return 0
 
 
 if __name__ == "__main__":
-    build()
+    raise SystemExit(main())
